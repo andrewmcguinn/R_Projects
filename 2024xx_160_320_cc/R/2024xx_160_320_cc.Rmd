@@ -1,0 +1,488 @@
+---
+title: "2024xx box 160 vs 320"
+author: "BIM"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE}
+library(readxl)
+library(dplyr)
+library(ggplot2);theme_set(theme_bw())
+library(here)
+library(scales)
+library(mgcv)
+library(viridisLite)
+
+```
+
+# Manual entries
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE}
+
+# Assign labels for plots
+test_gear <- "320mm Box"
+control_gear <- "160mm Box"
+
+# Provide MCRS data
+dat_mcrs <- data.frame(
+  species = c("Nephrops", "Haddock", "Whiting"),
+  mcrs = c(NA, 30, 25)
+  )
+
+# Choose species (must match values in excel file, case sensitive)
+# I've used Cod as there were no nephrops in the trial data and I wanted 3 species for plot layouts
+spp <- c("Cod", "Haddock", "Whiting")
+
+# Exclude select tows (e.g. to remove tow 13, exclude_tows <- c(13))
+# To keep all tows, just leave this blank e.g. exclude_tows <- c()
+exclude_tows <- c()
+
+```
+
+
+# Data import and processing
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE}
+
+# Read in from data excel
+dat_lengths <- read_excel(here("./data/2024xx_160_320_cc_data.xlsx"), sheet = "Length")
+dat_weights <- read_excel(here("./data/2024xx_160_320_cc_data.xlsx"), sheet = "Weight")
+
+# Data processing
+
+# Number of species to loop through
+n_spp <- length(spp)
+
+# Filter data to species of interest
+dat_lengths <- dat_lengths %>%
+  filter(species %in% spp)
+
+dat_weights <- dat_weights %>%
+  filter(species %in% spp)
+
+# Exclude tows
+dat_lengths <- dat_lengths %>%
+  filter(!tow_id %in% exclude_tows)
+dat_weights <- dat_weights %>%
+  filter(!tow_id %in% exclude_tows)
+
+# Assign compartment control/test
+dat_lengths$compartment <- ifelse(dat_lengths$gear == "box_160mm", 
+                                  "Control", "Test")
+dat_weights$compartment <- ifelse(dat_weights$gear == "box_160mm", 
+                                  "Control", "Test")
+
+# Calculate subsratio
+dat_weights <- dat_weights %>%
+  mutate(subsratio = subsample / weight)
+
+# Make a long dataframe with weight columns added
+dat_long <- left_join(x = dat_lengths, 
+                      y = dat_weights,
+                      by = c("tow_id", "compartment", "species", "gear"))
+
+
+# Convert categorical columns to factors
+factor_cols <- c("tow_id", "species", "compartment", "gear")
+dat_long[factor_cols] <- lapply(dat_long[factor_cols], as.factor) 
+rm(factor_cols)
+
+# Calculate raised counts
+dat_long <- dat_long %>%
+  mutate(raising_factor = 1/subsratio,
+         count_raised = count_n * raising_factor) %>%
+  select(-subsample, -raising_factor)
+
+# Calculate raised counts overall
+dat_long <- dat_long %>%
+  dplyr::group_by(species, length_id, compartment) %>%
+  dplyr::mutate(sum_count_raised = sum(count_raised)) %>%
+  dplyr::ungroup()
+
+
+# Assign mcrs
+dat_long <- left_join(x = dat_long,
+                      y = dat_mcrs %>% filter(species %in% unique(dat_long$species)),
+                      by = c("species"))
+
+# Wide format
+dat_wide <- dat_long %>%
+  tidyr::pivot_wider(values_from = c(count_raised, count_n),
+                     names_from = compartment,
+                     id_cols = c(species, length_id),
+                     values_fill = 0,
+                     values_fn = list(count_raised = sum,
+                                      count_n = sum))
+
+# Calculate raised count totals and proportions in test
+dat_wide <- dat_wide %>%
+  dplyr::group_by(species, length_id) %>%
+  dplyr::mutate(count_raised_total = sum(count_raised_Test, count_raised_Control),
+                prop_test = count_raised_Test / count_raised_total) %>%
+  dplyr::ungroup()
+
+# Assign mcrs
+dat_wide <- left_join(x = dat_wide,
+                      y = dat_mcrs %>% filter(species %in% unique(dat_long$species)),
+                      by = c("species"))
+
+# Create wide format at the tow level
+dat_wide_haul <- dat_long %>%
+  select(tow_id, species, compartment, length_id, 
+         count_n, count_raised, subsratio, mcrs) %>%
+  tidyr::pivot_wider(values_from = c(count_raised, count_n, subsratio),
+                     names_from = compartment,
+                     id_cols = c(species, length_id, tow_id),
+                     values_fill = NA,
+                     values_fn = list(count_raised = sum,
+                                      count_n = sum)) 
+
+# Assign 0 count to lengths not found in alternate compartment
+count_cols <- c("count_raised_Test",
+                "count_raised_Control",
+                "count_n_Test",
+                "count_n_Control")
+
+dat_wide_haul[count_cols][is.na(dat_wide_haul[count_cols])] <- 0
+
+dat_wide_haul <- dat_wide_haul %>%
+  dplyr::group_by(species, tow_id) %>%
+  tidyr::fill(subsratio_Test, subsratio_Control, .direction = "downup") 
+
+# Calculate raised count totals and proportions in test by haul
+dat_wide_haul <- dat_wide_haul %>%
+  dplyr::group_by(species, length_id, tow_id) %>%
+  dplyr::mutate(count_raised_total = sum(count_raised_Test, count_raised_Control),
+                prop_test = count_raised_Test / count_raised_total) %>%
+  dplyr::ungroup()
+
+# Join wide by haul data with mcrs
+dat_wide_haul <- dplyr::left_join(x = dat_wide_haul,
+                                  y = dat_mcrs %>% filter(species %in% unique(dat_long$species)),
+                                  by = c("species"))
+
+# Add offset for GAM fit
+dat_wide_haul <- dat_wide_haul %>%
+  dplyr::mutate(offset_gam = log((subsratio_Test / subsratio_Control)))
+```
+
+\newpage
+
+# Length frequency
+
+## By tow id {.tabset}
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+
+plot_lf_haul = list()
+for(i in 1:n_spp){
+  spp_i <- spp[i]
+  dat_i <- subset(dat_long, species == spp_i) 
+  
+  plot_lf_haul_i <-
+    ggplot(dat_i, aes(aes(x = length_id, y = count_raised))) + 
+    geom_col(aes(x = length_id, y = count_raised,
+                 group = compartment, color = compartment, fill = compartment),
+             position = "identity", alpha = 0.25, width = 1) +
+    geom_vline(aes(xintercept = mcrs), lty = 5, col = "red") +
+    scale_fill_viridis_d(end = 0.85) +
+    scale_colour_viridis_d(end = 0.85) +
+    facet_wrap(~tow_id, scales = "fixed", nrow = 2, drop = TRUE) +
+    xlab("Length") +
+    ylab("Raised Count") +
+    theme(legend.position = "bottom",
+          text = element_text(size = 14),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+    ggtitle(spp[i]) 
+  
+  plot_lf_haul[[i]] = plot_lf_haul_i
+  rm(dat_i, plot_lf_haul_i)
+}
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = 'asis', fig.height = 5, fig.width = 8}
+
+## Print plots
+for (i in 1:n_spp) {
+  spp_name <- spp[i]
+  cat("### ", spp_name ,"\n")
+  print(plot_lf_haul[[i]])
+  cat('\n\n')
+}
+
+```
+
+## Overall
+
+```{r, fig.align='center', echo = TRUE, message = FALSE, warning = FALSE, fig.height = 7, fig.width = 3.54}
+plot_lf <- ggplot(dat_long,
+                  aes(x = length_id, y = sum_count_raised,
+                      group = compartment, col = compartment)) +
+  geom_line(aes(lty = compartment)) +
+  geom_vline(data = dat_long, aes(xintercept = mcrs), col = "red", lty = 5) +
+  scale_colour_viridis_d(end = 0.75) +
+  facet_wrap(~ species, scales = "free", ncol = 1, drop = TRUE) +
+  expand_limits(y = 0) +
+  xlab("Length") +
+  ylab("Raised Count") +
+  theme(legend.position = "bottom",
+        text = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+plot_lf
+
+```
+
+# Proportion retained
+
+## By haul {.tabset}
+
+```{r, echo = TRUE, message = FALSE, warning = FALSE}
+plot_prop_haul = list()
+for(i in 1:n_spp){
+  spp_i <- spp[i]
+  dat_i <- subset(dat_wide_haul, species == spp_i)
+  plot_prop_haul_i <- ggplot(dat_i) +
+    geom_point(aes(x = length_id, y = prop_test,
+                   size = log(count_raised_total + 1)), pch = 21,
+               fill = "lightblue", alpha = 0.7) +
+    geom_vline(data = subset(dat_long, species == spp_i),
+               aes(xintercept = mcrs), lty = 5, col = "red") +
+    geom_hline(yintercept = 0.5, lty = 2) +
+    # scale_x_continuous(breaks = breaks_pretty(), labels = label_number(accuracy = 1)) +
+    ylim(c(0,1)) +
+    facet_wrap(~ tow_id, nrow = 2, drop = TRUE) +
+    xlab("Length") +
+    ylab(paste0("Proportion in ", test_gear)) +
+    theme(legend.position = "bottom",
+          text = element_text(size = 14),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+    ggtitle(spp[i])
+  
+  plot_prop_haul[[i]] = plot_prop_haul_i
+}
+## tidy workspace
+rm(spp_i, dat_i, plot_prop_haul_i)
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = 'asis', fig.height = 5, fig.width = 8}
+
+## Print plots
+for (i in 1:n_spp) {
+  spp_name <- spp[i]
+  cat("### ", spp_name ,"\n")
+  print(plot_prop_haul[[i]])
+  cat('\n\n')
+}
+
+```
+
+## Overall
+
+```{r, fig.align='center', echo = TRUE, message = FALSE, warning = FALSE, fig.height = 7, fig.width = 3.54}
+plot_prop <- ggplot(dat_wide) +
+  geom_point(aes(x = length_id, y = prop_test,
+                 size = log(count_raised_total + 1)), pch = 21,
+             fill = "lightblue", alpha = 0.7) +
+  geom_vline(data = dat_long,
+             aes(xintercept = mcrs), lty = 5, col = "red") +
+  geom_hline(yintercept = 0.5, lty = 2) +
+  # scale_x_continuous(breaks = breaks_pretty(), labels = label_number(accuracy = 1)) +
+  ylim(c(0,1)) +
+  facet_wrap(~ species, scales = "free", ncol = 1, drop = TRUE) +
+  xlab("Length") +
+  ylab(paste0("Proportion in ", test_gear)) +
+  theme(legend.position = "bottom",
+        text = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+print(plot_prop + guides(size=guide_legend(title="ln(Total + 1)")))
+
+```
+
+# Modelling
+
+```{r, fig.asp = 1, echo = TRUE, message = FALSE, warning = FALSE}
+## create containers for results
+gam_pred <- NULL 
+gam_pred_haul <- NULL
+
+for(i in 1:length(spp)){
+  spp_i <- spp[i]
+  dat0 <- subset(dat_wide_haul, species == spp_i)
+  dat0$ftow_id <- factor(dat0$tow_id)
+  spp_count_mat <- as.matrix(dat0[, c("count_n_Test", "count_n_Control")])
+  offset_gam <-
+    log(dat0[, "subsratio_Test"] / dat0[, "subsratio_Control"])
+  ## GAM
+  gam_fit <- gam(spp_count_mat ~ 
+                   s(length_id) +
+                   s(ftow_id, bs="re") +
+                 offset(offset_gam), 
+                 data = dat0, family = binomial,
+                 method = "ML")
+  
+  ## get predictions overall
+  length_range <- range(dat0$length_id)
+  pred_df <- data.frame(
+    species = spp_i,
+    length_id = length_range[1]:length_range[2],
+    offset_gam = 0, ftow_id = dat0$ftow_id[1])
+  pred <- predict(gam_fit, newdata = pred_df, se.fit = TRUE, 
+                  exclude = "s(ftow_id)")
+  
+  ## proportion
+  pred_df$p <- plogis(pred$fit)
+  pred_df$p_upper <- plogis(pred$fit + 1.96 * pred$se.fit)
+  pred_df$p_lower <- plogis(pred$fit - 1.96 * pred$se.fit)
+  pred_df$p_upper80 <- plogis(pred$fit + 1.28 * pred$se.fit)
+  pred_df$p_lower80 <- plogis(pred$fit - 1.28 * pred$se.fit)
+  
+  gam_pred <- rbind(gam_pred, pred_df)
+  
+  ## clear workspace
+  rm(list = c("pred_df"))
+  
+  ## predictions by haul
+  hauls <- unique(dat0$tow_id)
+  for(j in hauls){
+    haul_pred_i <- data.frame(
+      species = spp_i,
+      length_id = length_range[1]:length_range[2],
+      offset_gam = 0,
+      ftow_id = factor(j),
+      tow_id = j)
+    pred <- predict(gam_fit, newdata = haul_pred_i, se.fit = TRUE)
+    haul_pred_i$p <- plogis(pred$fit)
+    haul_pred_i$p_upper <- plogis(pred$fit + 1.96 * pred$se.fit)
+    haul_pred_i$p_lower <- plogis(pred$fit - 1.96 * pred$se.fit)
+
+    gam_pred_haul <- rbind(gam_pred_haul, haul_pred_i)
+    rm(haul_pred_i)
+  }
+}
+
+## tidy workspace
+rm(gam_re_i, gam_sd_i, theta, offset_gam, i, j, hauls, spp_count_mat, pred, dat0)
+
+```
+
+# Proportions retained with GAM overlay
+
+## By haul
+
+```{r, echo = TRUE, message = FALSE}
+
+plot_fit_prop_haul = list()
+
+for(i in 1:n_spp){
+  
+  dat_wide_haul_subset <- subset(dat_wide_haul, species == spp[i])
+  
+  plot_fit_prop_haul_i <- ggplot(dat_wide_haul_subset, 
+                               aes(x = length_id, y = prop_test)) +
+    geom_point(aes(size = log(count_raised_total + 1)), pch = 21, fill = "lightblue") +
+    geom_ribbon(data = subset(gam_pred_haul, species == spp[i]), 
+                aes(x = length_id, y = p, 
+                    ymin = p_lower, ymax = p_upper), fill = "orange", alpha = 0.5) +
+    geom_line(data = subset(gam_pred_haul, species == spp[i]), 
+              aes(x = length_id, y = p), colour = viridis(1)) +
+    geom_vline(data = subset(dat_mcrs, species == spp[i]), 
+               aes(xintercept = mcrs), lty = 5, col = "red") +
+    geom_hline(yintercept = 0.5, lty = 2) +
+    scale_x_continuous(breaks = breaks_pretty(), labels = label_number(accuracy = 1)) +
+    facet_wrap(~ tow_id, nrow = 2, drop = FALSE) +
+    xlab("Length (cm)") +
+    ylab(paste0("Proportion in ", test_gear)) +
+    theme(legend.position = "bottom",
+          text = element_text(size = 14),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()) +
+    ggtitle(spp[i]) 
+  
+  plot_fit_prop_haul[[i]] = plot_fit_prop_haul_i
+}
+
+rm(dat_wide_haul_subset, plot_fit_prop_haul_i)
+
+```
+
+\begin{landscape}
+
+```{r, fig.align='center', echo = FALSE, message = FALSE, fig.height = 8, fig.width = 6, results = "asis"}
+
+## Print plots
+for (i in 1:n_spp) {
+  print(plot_fit_prop_haul[[i]] + guides(size=guide_legend(title="ln(Total + 1)")))
+}
+
+```
+
+\end{landscape}
+
+\newpage
+
+## Overall
+
+```{r, fig.align='center', warning = FALSE, echo = TRUE, message = FALSE, fig.height = 7, fig.width = 3.54}
+
+plot_fit_prop <- ggplot(dat_wide) +
+  geom_point(aes(x = length_id, y = prop_test,
+                 size = log(count_raised_total + 1)), pch = 21, fill = "lightblue") +
+  geom_ribbon(data = gam_pred, 
+              aes(x = length_id, y = p, ymin = p_lower, ymax = p_upper),
+              fill = "orange", alpha = 0.3, colour = NA) +
+  geom_ribbon(data = gam_pred, 
+              aes(x = length_id, y = p, ymin = p_lower80, ymax = p_upper80),
+              fill = "orange", alpha = 0.5, colour = NA) +
+    geom_line(data = gam_pred, aes(x = length_id, y = p), colour = viridis(1), linewidth = 1) +
+  geom_vline(data = dat_wide, aes(xintercept = mcrs), lty = 5, col = "red") +
+  geom_hline(yintercept = 0.5, lty = 2) +
+  scale_x_continuous(breaks = breaks_pretty(), labels = label_number(accuracy = 1)) +
+  facet_wrap(~ species, scales = "free", ncol = 1, drop = TRUE) +
+  xlab("Length (cm)") +
+  ylab(paste0("Proportion in ", test_gear)) +
+  theme(legend.position = "bottom",
+        text = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title.y = element_text(margin = margin(t = 0, r = 10, b = 0, l = 0))) 
+
+print(plot_fit_prop + guides(size=guide_legend(title="ln(Total + 1)")))
+
+```
+
+\newpage
+
+## Overall with haul level curves
+
+```{r, fig.align='center', warning = FALSE, echo = TRUE, message = FALSE, fig.height = 7, fig.width = 3.54}
+
+plot_fit_prop_overall <- plot_fit_prop +
+  geom_line(data = gam_pred_haul, 
+            aes(x = length_id, y = p, group = ftow_id), 
+            colour = alpha(viridis(0.5), 0.5)) +
+      geom_line(data = gam_pred, aes(x = length_id, y = p), colour = viridis(1))
+
+
+print(plot_fit_prop_overall + 
+        guides(size=guide_legend(title="ln(Total + 1)")))
+
+```
